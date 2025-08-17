@@ -1,0 +1,71 @@
+trigger:
+- main
+pool: SelfHosted
+
+variables:
+- group: Variables
+parameters:
+- name: resourceGroup
+  type: string
+  default: ResourceGroup
+- name: vmName
+  type: string
+  default: VM
+
+stages:
+- stage: Terraform
+  displayName: "Terraform Deploy"
+  jobs:
+  - job: TerraformApply
+    steps:
+    - script: |
+        cd Terraform
+        terraform init -backend-config="backend.conf"
+        terraform plan -out=tfplan \
+          -var "resource_group_name=${{ parameters.resourceGroup }}" \
+          -var "vm_name=${{ parameters.vmName }}" 
+        terraform apply -auto-approve tfplan
+        VM_IP=$(terraform output -raw vm_public_ip)
+        echo "VM Public IP: $VM_IP"
+        echo "##vso[task.setvariable variable=vmPublicIP;isOutput=true]$VM_IP"
+      displayName: "Terraform Apply"
+      name: terraformStep  # Add name to reference the output variable
+      env:
+        ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+        ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+        ARM_TENANT_ID: $(ARM_TENANT_ID)
+        ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+
+- stage: Ansible
+  displayName: "Ansible Configuration"
+  dependsOn: Terraform
+  variables:
+    vmPublicIP: $[ stageDependencies.Terraform.TerraformApply.outputs['terraformStep.vmPublicIP'] ]
+  jobs:
+  - job: RunAnsible
+    displayName: "Configure VM with Ansible"
+    steps:
+      - task: DownloadSecureFile@1
+        name: sshkey
+        displayName: 'Download SSH Key'
+        inputs:
+          secureFile: 'id_rsa'  # nazwa twojego uploaded klucza
+      
+      - script: |
+          mkdir -p ~/.ssh
+          cp $(sshkey.secureFilePath) ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H $(vmPublicIP) >> ~/.ssh/known_hosts
+        displayName: 'Setup SSH Key'
+      
+      - script: |
+          sleep 30
+          echo "Creating temporary inventory file..."
+          INVENTORY_FILE=$(mktemp)
+         
+          echo "$(vmPublicIP) ansible_user=azureuser ansible_ssh_common_args='-o StrictHostKeyChecking=no'" > $INVENTORY_FILE
+         
+          echo "Running Ansible on $(vmPublicIP)"
+          cd Ansible
+          ansible-playbook -i $INVENTORY_FILE playbook.yml
+        displayName: 'Run Ansible Playbook'
